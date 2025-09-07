@@ -44,13 +44,14 @@ parser.add_argument('--validate_every', default=5000, help='do validation after 
 parser.add_argument('--generate_every', default=50000, help='do eneration after iterations')
 parser.add_argument('--generate_length', default=300, help='number of tokens to generate')
 parser.add_argument('--net', default='ECPAttention') # options: PerceiverAR,DoubleAttention,CompressedDoubleAttention, sSplitAttention, ECPAttention 
+parser.add_argument('--net_dropout', default=0.05)
 parser.add_argument('--heads', default=6, type=int)
-parser.add_argument('--layers', default=6, type=int)  # depth
+parser.add_argument('--layers', default=12, type=int)  # depth
 parser.add_argument('--batch_size', default=8, type=int)  
-parser.add_argument('--sequence_length', default=1024, type=int)  
-parser.add_argument('--latent_length', default=1024, type=int) # for PerceiverAR models 
+parser.add_argument('--sequence_length', default=2048, type=int)  
+parser.add_argument('--latent_length', default=2048, type=int) # for PerceiverAR models 
 # ***for ECPAttention, set latent_len = sequence_length (to generalize the autoregresivewrapper)
-parser.add_argument('--num_segments', default=4, type=int) # number of segments to split seq into
+parser.add_argument('--num_segments', default=8, type=int) # number of segments to split seq into
 parser.add_argument('--num_iterations', default=5e5, type=int)
 parser.add_argument('--dim', default=768, type=int) # embedding dimesnion
 parser.add_argument('--do_word_level_modeling', default=True) # false for character level
@@ -119,8 +120,16 @@ def configure_optimizers(mymodel):
     optimizer = torch.optim.AdamW(optim_groups, lr=args.lr, betas=(0.9,0.95))
     return optimizer
 
+
 def compute_perplexity_huggingface(model,test_set,device,max_len=args.sequence_length):
     global LAST_BEST_PERPLEXITY
+    model.eval()
+    #--------------set dropout to 0-------------
+    model.model.ff_dropout = 0
+    model.model.attn_dropout = 0
+    for attn, ff in model.model.layers:
+        attn.attn_dropout = nn.Dropout(0)
+    #--------------end set dropout to 0--------
     stride = max_len//2
     encodings = test_set.data
     encodings = encodings.view(1,encodings.size(0)*encodings.size(1))
@@ -128,7 +137,7 @@ def compute_perplexity_huggingface(model,test_set,device,max_len=args.sequence_l
     nlls = []
     prev_end_loc = 0
     count = 0
-    for begin_loc in tqdm(range(0, seq_len, stride)):
+    for begin_loc in range(0, seq_len, stride):
         end_loc = min(begin_loc + max_len+1, seq_len+1)
         if (end_loc - begin_loc) < (max_len+1):
             continue
@@ -144,8 +153,8 @@ def compute_perplexity_huggingface(model,test_set,device,max_len=args.sequence_l
         prev_end_loc = end_loc
         if end_loc == seq_len:
             break
-    avg_loss = torch.stack(nlls).mean()
-    ppl = torch.exp(avg_loss)
+
+    ppl = torch.exp(torch.stack(nlls).mean())
     best_found = False
     if LAST_BEST_PERPLEXITY == 999:
         LAST_BEST_PERPLEXITY = ppl
@@ -156,7 +165,13 @@ def compute_perplexity_huggingface(model,test_set,device,max_len=args.sequence_l
             # save the best model
 
     #print("-----------Perplexity------------- = ", ppl, "----loss=",torch.stack(nlls).mean())
-    return best_found, ppl, avg_loss
+    #--------------restore dropout -------------
+    model.model.ff_dropout = args.net_dropout
+    model.model.attn_dropout = args.net_dropout
+    for attn, ff in model.model.layers:
+        attn.attn_dropout = nn.Dropout(args.net_dropout)
+    #--------------end restoret dropout--------        
+    return best_found, ppl, loss
 
 def save_model(model, i, optim, fname):
     print("----------saving model-----------------")
@@ -183,6 +198,8 @@ def main():
             heads = args.heads, 
             sequence_len = args.sequence_length,
             latent_len = args.latent_length,
+            ff_dropout = args.net_dropout,
+            attn_dropout = args.net_dropout
         ).to(device)
 
     if args.net=="DoubleAttention":
@@ -192,7 +209,9 @@ def main():
             num_layers = args.layers, 
             heads = args.heads, 
             sequence_len = args.sequence_length,
-            latent_len = args.latent_length
+            latent_len = args.latent_length,
+            ff_dropout = args.net_dropout,
+            attn_dropout = args.net_dropout
          ).to(device)
 
     if args.net=="CompressedDoubleAttention":
@@ -204,7 +223,9 @@ def main():
             heads = args.heads, 
             sequence_len = args.sequence_length,
             latent_len = args.latent_length,
-            compression_size = compression_size
+            compression_size = compression_size,
+            ff_dropout = args.net_dropout,
+            attn_dropout = args.net_dropout
          ).to(device)    
     if args.net=="sSplitAttention":
         net = sSplitAttentionTransformer(
@@ -214,7 +235,9 @@ def main():
             heads = args.heads, 
             sequence_len = args.sequence_length,
             latent_len = args.latent_length,
-            num_segments = args.num_segments
+            num_segments = args.num_segments,
+            ff_dropout = args.net_dropout,
+            attn_dropout = args.net_dropout
          ).to(device)
     if args.net=="ECPAttention":   # context propagating segment architecture
         net = ECPAttentionTransformer(
@@ -223,7 +246,9 @@ def main():
             num_layers = args.layers, 
             heads = args.heads, 
             sequence_len = args.sequence_length,
-            num_segments = args.num_segments
+            num_segments = args.num_segments,
+            ff_dropout = args.net_dropout,
+            attn_dropout = args.net_dropout
          ).to(device)
 
     model = AutoRegressiveWrapper(net, latent_len=args.latent_length,segment_len = args.sequence_length//args.num_segments)
@@ -251,7 +276,7 @@ def main():
         model.model.attn_dropout = 0
         for attn, ff in model.model.layers:
             attn.attn_dropout = nn.Dropout(0)
-        test_model_file_name = "D:/NLP/ECPTrainedModels/TransECP_1048_768_6_6_4Seg_Perplex_21_4_500K.pt"  # change this accordingly
+        test_model_file_name = "D:/NLP/saved_model.pt"  # change this accordingly
         checkpoint_data = torch.load(test_model_file_name)
         model.load_state_dict(checkpoint_data['state_dict'])
         optim.load_state_dict(checkpoint_data['optimizer'])
@@ -264,7 +289,7 @@ def main():
     if args.resume == False:
         start = 0
     else:
-        restore_model_file_name = "checkpoint/" + model_file_name  # change this accordingly
+        restore_model_file_name = model_file_name  # change this accordingly
         checkpoint_data = torch.load(restore_model_file_name)
         model.load_state_dict(checkpoint_data['state_dict'])
         optim.load_state_dict(checkpoint_data['optimizer'])
@@ -282,7 +307,7 @@ def main():
             loss.backward()
         if (i%100 == 0):
             #print(f'training loss: {loss.item()} -- iteration = {i}')
-            pbar.set_postfix({"training loss": f"{loss.item():.4f}","iteration": i, "last best perplexity": LAST_BEST_PERPLEXITY})
+            pbar.set_postfix({"training loss": f"{loss.item():.4f}","iteration": i})
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optim.step()
@@ -299,7 +324,7 @@ def main():
             if ret == True: # save best model
                 pbar.set_postfix({"saving best model - perplexity":perplexity})
                 save_model(model,i,optim,model_file_name) # save best model
-            pbar.set_postfix({"val loss": f"{loss.item():.4f}","iteration": i,"perplexity" :f"{perplexity:.4f}"})
+            pbar.set_postfix({"val loss": f"{loss.item():.4f}","iteration": i,"perp" :f"{perplexity:.4f}", "BEST_perp" :f"{LAST_BEST_PERPLEXITY:.4f}"})
         #--------------------------for character level modeling------------------------
         if ((i+0) % args.validate_every == 0) and (args.do_word_level_modeling == False):
            model.eval()
@@ -315,7 +340,7 @@ def main():
         #----------------------------end do validation--------------------------
             
         #---------------------------do generation-------------------------------
-        if args.generate_every == 0:  # see if model is generating in a meaningful way
+        if (i+1)%args.generate_every == 0:  # see if model is generating in a meaningful way
             model.eval()
             inp = random.choice(val_dataset)[:-1]
             if args.do_word_level_modeling == True:
